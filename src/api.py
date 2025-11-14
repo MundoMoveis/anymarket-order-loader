@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 from datetime import datetime
-from src.jobs import backfill_orders_interval
+from src.jobs import backfill_full_range
 from src.log import log
 
 router = APIRouter()
@@ -26,11 +26,11 @@ async def sync_one(order_id: str):
 
 @router.post("/anymarket/backfill")
 async def anymarket_backfill(
-    start: datetime = Query(..., description="Data/hora inicial, ex: 2023-01-01T00:00:00-03:00"),
-    end: datetime = Query(..., description="Data/hora final, ex: 2023-12-31T23:59:59-03:00"),
+    start: datetime = Query(..., description="Data/hora inicial"),
+    end: datetime = Query(..., description="Data/hora final"),
 ):
     try:
-        result = await backfill_orders_interval(start, end)
+        result = await backfill_full_range(start, end)
         return result
     except Exception as e:
         log.exception("backfill error")

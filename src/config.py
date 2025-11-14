@@ -4,6 +4,7 @@ import os
 load_dotenv()
 
 class Cfg:
+    ANY_BACKFILL_MAX_DAYS = int(os.getenv("ANY_BACKFILL_MAX_DAYS", "90"))  # menor que 120
     PORT = int(os.getenv("PORT", "8080"))
     ANY_BASE = os.getenv("ANYMARKET_BASE_URL", "https://api.anymarket.com.br/v2")
     ANY_TOKEN = os.getenv("ANYMARKET_TOKEN") or os.getenv("ANYMARKET_GUNGA_TOKEN", "")

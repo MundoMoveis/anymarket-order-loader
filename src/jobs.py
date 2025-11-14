@@ -108,3 +108,42 @@ async def backfill_orders_interval(start: datetime, end: datetime) -> dict:
         "start": created_after,
         "end": created_before,
     }
+
+async def backfill_full_range(start: datetime, end: datetime) -> dict:
+    """
+    Faz backfill de todo o intervalo [start, end],
+    quebrando em janelas de no máximo ANY_BACKFILL_MAX_DAYS.
+    """
+    max_days = max(1, Cfg.ANY_BACKFILL_MAX_DAYS)
+    current_start = start
+    total_processed = 0
+    windows: list[dict] = []
+
+    while current_start < end:
+        current_end = current_start + timedelta(days=max_days)
+        if current_end > end:
+            current_end = end
+
+        log.info(
+            "backfill window: %s -> %s (max %s dias)",
+            current_start.isoformat(), current_end.isoformat(), max_days
+        )
+
+        try:
+            result = await backfill_orders_interval(current_start, current_end)
+            total_processed += result.get("processed", 0)
+            windows.append({
+                "start": result.get("start"),
+                "end": result.get("end"),
+                "processed": result.get("processed", 0),
+            })
+        except Exception as e:
+            log.error("backfill window error (%s -> %s): %s", current_start, current_end, e)
+
+        # próxima janela
+        current_start = current_end
+
+    return {
+        "processed": total_processed,
+        "windows": windows,
+    }
