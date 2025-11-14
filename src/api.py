@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Query
 from datetime import datetime
-from src.jobs import backfill_full_range
+from src.jobs import backfill_full_range, process_feed_cycle
 from src.log import log
 
 router = APIRouter()
