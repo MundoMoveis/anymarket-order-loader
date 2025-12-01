@@ -77,7 +77,7 @@ class AnyMarketClient:
         return data if isinstance(data, dict) else {}
 
     async def list_returns(self, order_id: str) -> list[dict]:
-        r = await self._client.get(f"/orders/{order_id}/returns")
+        r = await self._client.get(f"/orders/returns/{order_id}")
         r.raise_for_status()
         data = r.json()
         if isinstance(data, list):
