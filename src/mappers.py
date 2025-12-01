@@ -1,6 +1,17 @@
 import json
 from datetime import datetime
 
+def as_bool(v) -> bool | None:
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        return v.strip().lower() in ("1", "true", "t", "yes", "y", "sim")
+    return None
+
 def safe_json(obj):
     try:
         return json.dumps(obj, ensure_ascii=False)
@@ -34,24 +45,25 @@ def map_header(p: dict, marketplace_id: int) -> dict:
             p = {}
     ship = p.get("shipping") or {}
     totals = p.get("totals") or {}
+    is_fulfillment = as_bool(p.get("fulfillment"))
     #print(p)
     return {
         "id": p.get("id"),
         "marketplace_id": marketplace_id,
-        "marketplace_order_id": p.get("externalId") or p.get("marketplaceId"),
-        "channel": p.get("marketplace") or p.get("channel"),
-        "fulfillment_type": "FULFILLMENT" if ship.get("fulfillment") == "FULFILLMENT" else "OWN_LOGISTICS",
+        "marketplace_order_id": p.get("marketPlaceId"),
+        "channel": p.get("marketPlace"),
+        "fulfillment_type": "FULFILLMENT" if is_fulfillment else "OWN_LOGISTICS",
         "status": p.get("status"),
-        "substatus": p.get("subStatus"),
+        "substatus": p.get("marketPlaceStatus"),
         "buyer_name": (p.get("buyer") or {}).get("name"),
         "buyer_document": (p.get("buyer") or {}).get("document"),
         "buyer_email": (p.get("buyer") or {}).get("email"),
         "total_amount": p.get("total"),
         "total_discount": p.get("discount"),
         "freight_amount": p.get("freight"),
-        "created_at_marketplace": dt(p.get("createdAt")) if p.get("createdAt") else None,
-        "approved_at": dt(p.get("paymentDate")) if p.get("approvedAt") else None,
-        "cancelled_at": dt(p.get("cancelledAt")) if p.get("cancelledAt") else None,
+        "created_at_marketplace": dt(p.get("createdAt")),
+        "approved_at": dt(p.get("paymentDate")),
+        "cancelled_at": dt(p.get("cancelDate")),
         "shipped_at": dt(ship.get("shippedAt")) if ship.get("shippedAt") else None,
         "delivered_at": dt(ship.get("deliveredAt")) if ship.get("deliveredAt") else None,
         "created_at": datetime.utcnow(),
@@ -129,9 +141,9 @@ def map_payments(order_id: str, pays: list[dict]) -> list[dict]:
     for p in pays or []:
         out.append({
             "order_id": order_id,
-            "method": p.get("method"),
+            "method": p.get("paymentDetailNormalized"),
             "installments": p.get("installments"),
-            "amount": p.get("amount"),
+            "amount": p.get("value"),
             "transaction_id": p.get("transactionId"),
             "status": p.get("status"),
             "authorized_at": dt(p.get("authorizedAt")) if p.get("authorizedAt") else None,
@@ -150,7 +162,7 @@ def map_shipping(order_id: str, s: dict | None) -> dict | None:
         "service": s.get("service"),
         "tracking_code": s.get("trackingCode"),
         "promised_delivery": dt(s.get("promisedDeliveryDate")) if s.get("promisedDeliveryDate") else None,
-        "shipped_at": dt(s.get("shippedAt")) if s.get("shippedAt") else None,
+        "shipped_at": dt(s.get("shippedAt")) if s.get("shippedAt") else None,   
         "delivered_at": dt(s.get("deliveredAt")) if s.get("deliveredAt") else None,
         "receiver_name": s.get("receiverName"),
         "address_street": s.get("street"),
