@@ -1,8 +1,15 @@
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from src.mappers import map_header, map_items, map_payments, map_shipping, map_invoice, map_history, map_returns
+from datetime import datetime
 
 from src.log import log
+
+def safe_json(obj):
+    try:
+        return json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return "{}"
 
 def debug_params(params):
     out = {}
@@ -13,24 +20,20 @@ def debug_params(params):
 async def upsert_order_tree(session: AsyncSession, payload: dict, marketplace_id: int = 1):
     order_id =payload["id"]
 
-    old = await session.execute(
-        text("SELECT status, substatus FROM anymarket_orders WHERE id = :id"),
+    res = await session.execute(
+        text("""
+            SELECT status, substatus
+            FROM anymarket_orders
+            WHERE id = :id
+        """),
         {"id": payload["id"]},
     )
-    row = old.fetchone()
+    row = res.fetchone()
+    old_status = row.status if row else None
+    old_substatus = row.substatus if row else None
 
-    if row:
-        old_status = row.status
-        new_status = payload["status"]
-        if new_status and new_status != old_status:
-            await session.execute(
-                text("""
-                    INSERT INTO anymarket_order_status_history
-                    (order_id, old_status, new_status, changed_at)
-                    VALUES (:oid, :old, :new, NOW())
-                """),
-                {"oid": payload["id"], "old": old_status, "new": new_status},
-            )
+    new_status = payload.get("status")
+    new_substatus = payload.get("substatus")
 
     # HEADER
     h = map_header(payload, marketplace_id)
@@ -65,6 +68,35 @@ async def upsert_order_tree(session: AsyncSession, payload: dict, marketplace_id
         updated_at=VALUES(updated_at),
         extra_json=VALUES(extra_json)
       """), h)
+
+      # registra histórico apenas se houve mudança de status ou substatus
+      if old_status is None and old_substatus is None:
+          # primeira vez que esse pedido aparece: opcional
+          history_needed = True
+      else:
+          history_needed = (
+              (new_status and new_status != old_status)
+              or (new_substatus and new_substatus != old_substatus)
+          )
+
+      if history_needed:
+          await session.execute(
+              text("""
+                  INSERT INTO anymarket_order_status_history
+                      (order_id, status, substatus, source, occurred_at, payload)
+                  VALUES
+                      (:order_id, :status, :substatus, :source, :occurred_at, :payload)
+              """),
+              {
+                  "order_id": payload["id"],
+                  "status": new_status or old_status,
+                  "substatus": new_substatus or old_substatus,
+                  "source": "FEED",  # ou "BACKFILL" quando vier do backfill
+                  "occurred_at": datetime.utcnow(),
+                  "payload": safe_json(payload),  # snapshot completo do pedido
+              },
+          )
+
     except Exception as e:
         log.error("HEADER ERROR: %s", e)
         log.error("PARAM TYPES: %s", debug_params(h))

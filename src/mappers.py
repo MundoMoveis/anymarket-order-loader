@@ -1,5 +1,18 @@
 import json
-from datetime import datetime
+from datetime import datetime, timezone
+
+def parse_dt(value):
+    """Converte string ISO do ANYMARKET para datetime (ou None)."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        # trata datas tipo "2019-08-24T14:15:22Z"
+        s = str(value).replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except Exception:
+        return None
 
 def as_bool(v) -> bool | None:
     if v is None:
