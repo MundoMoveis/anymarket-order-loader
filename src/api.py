@@ -1,6 +1,7 @@
+import asyncio
 from fastapi import APIRouter, HTTPException, Query
 from datetime import datetime
-from src.jobs import backfill_full_range, process_feed_cycle
+from src.jobs import backfill_full_range, process_feed_cycle, hydrate_order, hydrate_range
 from src.log import log
 
 router = APIRouter()
@@ -35,3 +36,12 @@ async def anymarket_backfill(
     except Exception as e:
         log.exception("backfill error")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/anymarket/hydrate-range")
+async def anymarket_hydrate_range(start: str = Body(..., embed=True)):
+    """
+    Reprocessa todos os pedidos já existentes na base a partir de `start`
+    (ex: "2025-10-01").
+    """
+    asyncio.create_task(hydrate_range(start))  # se quiser rodar async em background
+    return {"ok": True}

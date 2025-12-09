@@ -153,7 +153,6 @@ class AnyMarketClient:
         MAX_BATCH = 50
 
         for i in range(0, len(payload), MAX_BATCH):
-            print(payload)
             batch = payload[i : i + MAX_BATCH]
 
             for attempt in range(3):

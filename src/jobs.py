@@ -147,3 +147,40 @@ async def backfill_full_range(start: datetime, end: datetime) -> dict:
         "processed": total_processed,
         "windows": windows,
     }
+
+async def hydrate_range(start: str):
+    # 1) pegar todos os IDs da base
+    async with Session() as session:
+        res = await session.execute(
+            text("""
+                SELECT id
+                FROM anymarket_orders
+                WHERE created_at_marketplace >= :start
+                ORDER BY created_at_marketplace
+            """),
+            {"start": start},
+        )
+        ids = [str(row[0]) for row in res.fetchall()]
+
+    client = AnyMarketClient()
+    total = len(ids)
+    for idx, oid in enumerate(ids, start=1):
+        try:
+            full = await client.get_order(oid)
+            try:
+                rets = await client.list_returns(oid)
+                if rets:
+                    full["returns"] = rets
+            except Exception:
+                pass
+
+            async with Session() as session:
+                async with session.begin():
+                    await upsert_order_tree(session, full, map_marketplace_id(full))
+
+        except Exception as e:
+            log.error("hydrate_range: erro no pedido %s: %s", oid, e)
+        if idx % 100 == 0:
+            log.info("hydrate_range: %s/%s pedidos reprocessados", idx, total)
+
+    await client.aclose()
