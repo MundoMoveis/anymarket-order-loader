@@ -1,4 +1,6 @@
 import time
+
+from sqlalchemy import text
 from src.clients.anymarket import AnyMarketClient, FeedItem
 from src.db import Session
 from src.upsert import upsert_order_tree
