@@ -150,10 +150,75 @@ async def backfill_full_range(start: datetime, end: datetime) -> dict:
         "windows": windows,
     }
 
+import asyncio
+import httpx
+from src.log import log
+
+async def fetch_order_with_retry(client, order_id: str, max_retries: int = 5):
+    """
+    Faz GET /orders/{id} respeitando 429 (Too Many Requests).
+    Usa Retry-After se o header existir, senão faz backoff exponencial.
+    """
+    delay = 1  # segundos, backoff inicial
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            full = await client.get_order(order_id)
+            return full
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+
+            # Trata especificamente 429
+            if status == 429:
+                retry_after = e.response.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        wait = int(retry_after)
+                    except ValueError:
+                        wait = delay
+                else:
+                    wait = delay
+
+                log.warning(
+                    "hydrate_range: 429 no pedido %s (tentativa %s/%s), "
+                    "aguardando %ss",
+                    order_id, attempt, max_retries, wait,
+                )
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, 60)  # limite de 60s
+                continue  # tenta de novo
+
+            # Outros HTTPStatusError: loga e propaga
+            log.error(
+                "hydrate_range: erro HTTP no pedido %s (status=%s): %s",
+                order_id, status, e,
+            )
+            raise
+
+        except httpx.HTTPError as e:
+            # erro de rede/timeout etc → retry com backoff
+            log.warning(
+                "hydrate_range: erro HTTP genérico no pedido %s "
+                "(tentativa %s/%s): %s",
+                order_id, attempt, max_retries, e,
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+            continue
+
+    # Se esgotou retry:
+    log.error(
+        "hydrate_range: falha definitiva no pedido %s depois de %s tentativas",
+        order_id, max_retries,
+    )
+    return None
+
+
 async def hydrate_range(start: str):
-    # 1) pegar todos os IDs da base
+    # 1) pega IDs na base
     async with Session() as session:
-        res = await session.execute(
+        rows = (await session.execute(
             text("""
                 SELECT id
                 FROM anymarket_orders
@@ -161,14 +226,24 @@ async def hydrate_range(start: str):
                 ORDER BY created_at_marketplace
             """),
             {"start": start},
-        )
-        ids = [str(row[0]) for row in res.fetchall()]
+        )).scalars().all()
+        ids = [str(x) for x in rows]
+
+    total = len(ids)
+    log.info("hydrate_range: iniciando reprocesso de %s pedidos a partir de %s",
+             total, start)
 
     client = AnyMarketClient()
-    total = len(ids)
+
     for idx, oid in enumerate(ids, start=1):
+        # pequeno intervalo fixo entre chamadas para respeitar QPS
+        await asyncio.sleep(0.2)  # 5 requisições/segundo aprox.
+
         try:
-            full = await client.get_order(oid)
+            full = await fetch_order_with_retry(client, oid)
+            if not full:
+                continue  # já logamos o erro no helper
+
             try:
                 rets = await client.list_returns(oid)
                 if rets:
@@ -180,9 +255,14 @@ async def hydrate_range(start: str):
                 async with session.begin():
                     await upsert_order_tree(session, full, map_marketplace_id(full))
 
+            if idx % 100 == 0:
+                log.info(
+                    "hydrate_range: %s/%s pedidos reprocessados",
+                    idx, total,
+                )
+
         except Exception as e:
-            log.error("hydrate_range: erro no pedido %s: %s", oid, e)
-        if idx % 100 == 0:
-            log.info("hydrate_range: %s/%s pedidos reprocessados", idx, total)
+            log.error("hydrate_range: erro inesperado no pedido %s: %s", oid, e)
 
     await client.aclose()
+    log.info("hydrate_range: concluído (%s pedidos)", total)
