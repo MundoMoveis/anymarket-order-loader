@@ -1,11 +1,16 @@
 import httpx
 from dataclasses import dataclass
 from src.config import Cfg
+from src.log import log
+import asyncio
 
 @dataclass
 class FeedItem:
     id: str
-    resourceId: str
+    resourceId: str | None = None
+    status: str | None = None
+    token: str | None = None
+    type: str | None = None
 
 class AnyMarketClient:
     def __init__(self, base: str | None = None, token: str | None = None):
@@ -39,7 +44,6 @@ class AnyMarketClient:
         r.raise_for_status()
         data = r.json()
 
-        # Normaliza: pode vir dict com "items"/"data"/"content" OU lista crua
         if isinstance(data, dict):
             raw = data.get("items") or data.get("data") or data.get("content") or []
         elif isinstance(data, list):
@@ -50,13 +54,42 @@ class AnyMarketClient:
         items: list[FeedItem] = []
         for it in raw:
             if isinstance(it, dict):
-                rid = it.get("resourceId") or it.get("orderId") or it.get("resource_id") or it.get("id")
+                rid = (
+                    it.get("resourceId")
+                    or it.get("orderId")
+                    or it.get("resource_id")
+                    or it.get("id")
+                )
                 fid = it.get("id") or it.get("eventId") or rid
-                if rid:
-                    items.append(FeedItem(id=str(fid), resourceId=str(rid)))
+
+                status = it.get("status") or "PENDING"
+                token = it.get("token")
+                ftype = it.get("type") or it.get("eventType") or "ORDER"
+
+                if fid is None:
+                    continue
+
+                items.append(
+                    FeedItem(
+                        id=str(fid),
+                        resourceId=str(rid) if rid is not None else None,
+                        status=status,
+                        token=token,
+                        type=ftype,
+                    )
+                )
             else:
-                # item simples (string/number) → trate como orderId
-                items.append(FeedItem(id=str(it), resourceId=str(it)))
+                # item simples (string/number) – sem info pra ACK, usa defaults
+                items.append(
+                    FeedItem(
+                        id=str(it),
+                        resourceId=str(it),
+                        status="PENDING",
+                        token=None,
+                        type="ORDER",
+                    )
+                )
+
         return items
 
     async def get_order(self, order_id: str) -> dict:
@@ -84,13 +117,81 @@ class AnyMarketClient:
             return data
         return (data.get("items") or []) if isinstance(data, dict) else []
 
-
     async def ack_feed(self, items: list[FeedItem]) -> None:
+        """
+        Envia ACK para o feed do ANYMARKET no formato esperado:
+        [{ "id", "status", "token", "type" }, ...]
+        """
         if not items:
             return
-        body = [{"id": it.id} for it in items]
-        r = await self._client.put("/orders/feeds/batch", json=body)
-        r.raise_for_status()
+
+        payload: list[dict] = []
+        for it in items:
+            if not it.token:
+                log.warning("ACK feed: item %s sem token, ignorando no ACK", it.id)
+                continue
+
+            # id pode ser numérico; se falhar cast, manda string mesmo
+            try:
+                ack_id = int(it.id)
+            except ValueError:
+                ack_id = it.id
+
+            payload.append(
+                {
+                    "id": ack_id,
+                    "status": it.status or "PENDING",
+                    "token": it.token,
+                    "type": it.type or "ORDER",
+                }
+            )
+
+        if not payload:
+            return
+
+        # em lotes menores, pra evitar limite de payload
+        MAX_BATCH = 50
+
+        for i in range(0, len(payload), MAX_BATCH):
+            print(payload)
+            batch = payload[i : i + MAX_BATCH]
+
+            for attempt in range(3):
+                try:
+                    r = await self._client.put("/orders/feeds/batch", json=batch)
+                    r.raise_for_status()
+                    log.info(
+                        "ACK feed: lote %s..%s ok (%s eventos)",
+                        i,
+                        i + len(batch) - 1,
+                        len(batch),
+                    )
+                    break
+                except httpx.HTTPStatusError as e:
+                    status = e.response.status_code
+                    body = e.response.text[:500]
+                    log.error(
+                        "ACK feed erro HTTP (status=%s, tent=%s): body=%s",
+                        status,
+                        attempt + 1,
+                        body,
+                    )
+                    if 500 <= status < 600 and attempt < 2:
+                        await asyncio.sleep(2**attempt)
+                        continue
+                    # se não for 5xx ou esgotou tentativas, para esse lote
+                    break
+                except httpx.HTTPError as e:
+                    log.error(
+                        "ACK feed erro HTTP genérico (tent=%s): %s",
+                        attempt + 1,
+                        e,
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(2**attempt)
+                        continue
+                    break
+
 
     async def aclose(self):
         await self._client.aclose()

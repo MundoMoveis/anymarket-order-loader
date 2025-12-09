@@ -13,6 +13,25 @@ def debug_params(params):
 async def upsert_order_tree(session: AsyncSession, payload: dict, marketplace_id: int = 1):
     order_id =payload["id"]
 
+    old = await session.execute(
+        text("SELECT status, delivery_status FROM anymarket_orders WHERE id = :id"),
+        {"id": payload["id"]},
+    )
+    row = old.fetchone()
+
+    if row:
+        old_status = row.status
+        new_status = payload["status"]
+        if new_status and new_status != old_status:
+            await session.execute(
+                text("""
+                    INSERT INTO anymarket_order_status_history
+                    (order_id, old_status, new_status, changed_at)
+                    VALUES (:oid, :old, :new, NOW())
+                """),
+                {"oid": payload["id"], "old": old_status, "new": new_status},
+            )
+
     # HEADER
     h = map_header(payload, marketplace_id)
     try:
@@ -75,7 +94,7 @@ async def upsert_order_tree(session: AsyncSession, payload: dict, marketplace_id
 
     # PAYMENTS
     await session.execute(text("DELETE FROM anymarket_order_payments WHERE order_id=:id"), {"id": order_id})
-    pays = map_payments(order_id, payload.get("payments") or [])
+    pays = map_payments(order_id, payload.get("payments") or [], payload)
     if pays:
         try:
           await session.execute(text("""
@@ -96,7 +115,7 @@ async def upsert_order_tree(session: AsyncSession, payload: dict, marketplace_id
           raise
 
     # SHIPPING upsert
-    ship = map_shipping(order_id, payload.get("shipping"))
+    ship = map_shipping(order_id, payload.get("shipping"), payload)
     if ship:
         try:
           await session.execute(text("""

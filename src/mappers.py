@@ -44,9 +44,15 @@ def map_header(p: dict, marketplace_id: int) -> dict:
         else:
             p = {}
     ship = p.get("shipping") or {}
-    totals = p.get("totals") or {}
     is_fulfillment = as_bool(p.get("fulfillment"))
-    #print(p)
+    tracking = p.get("tracking") or {}
+
+    shipped_at = parse_dt(
+        tracking.get("shippedDate")
+        or tracking.get("date")  # fallback
+    )
+    delivered_at = parse_dt(tracking.get("deliveredDate"))
+
     return {
         "id": p.get("id"),
         "marketplace_id": marketplace_id,
@@ -64,8 +70,8 @@ def map_header(p: dict, marketplace_id: int) -> dict:
         "created_at_marketplace": dt(p.get("createdAt")),
         "approved_at": dt(p.get("paymentDate")),
         "cancelled_at": dt(p.get("cancelDate")),
-        "shipped_at": dt(ship.get("shippedAt")) if ship.get("shippedAt") else None,
-        "delivered_at": dt(ship.get("deliveredAt")) if ship.get("deliveredAt") else None,
+        "shipped_at": shipped_at,
+        "delivered_at": delivered_at,
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
         "extra_json": safe_json(p)
@@ -136,38 +142,76 @@ def map_items(order_id: str, items: list[dict]) -> list[dict]:
     return out
 
 
-def map_payments(order_id: str, pays: list[dict]) -> list[dict]:
+def map_payments(order_id: str, pays: list[dict], payload) -> list[dict]:
     out = []
+    order_payment_date = parse_dt(payload.get("paymentDate"))
+    order_cancel_date = parse_dt(payload.get("cancelDate"))
+
     for p in pays or []:
         out.append({
             "order_id": order_id,
             "method": p.get("paymentDetailNormalized"),
             "installments": p.get("installments"),
             "amount": p.get("value"),
-            "transaction_id": p.get("transactionId"),
+            "transaction_id": p.get("marketplaceId") or p.get("orderAuthorizationCardCode"),
             "status": p.get("status"),
-            "authorized_at": dt(p.get("authorizedAt")) if p.get("authorizedAt") else None,
-            "paid_at": dt(p.get("paidAt")) if p.get("paidAt") else None,
-            "canceled_at": dt(p.get("canceledAt")) if p.get("canceledAt") else None,
+            "authorized_at": order_payment_date,
+            "paid_at": order_payment_date,
+            "canceled_at": order_cancel_date,
             "extra_json": safe_json(p)
         })
     return out
 
-def map_shipping(order_id: str, s: dict | None) -> dict | None:
+def map_shipping(order_id: str, s: dict | None, payload) -> dict | None:
     if not s: return None
+    shipping = payload.get("shipping") or {}
+    tracking = payload.get("tracking") or {}
+
+    # tenta pegar service/carrier a partir dos items[].shippings[] também
+    items = payload.get("items") or []
+    first_ship = None
+    for it in items:
+        sh_list = it.get("shippings") or []
+        if sh_list:
+            first_ship = sh_list[0]
+            break
+
+    carrier = (
+        tracking.get("carrier")
+        or (first_ship.get("shippingCarrierNormalized") if first_ship else None)
+    )
+    service = (
+        (first_ship.get("shippingtype") if first_ship else None)
+        or payload.get("shippingOptionId")
+    )
+
+    tracking_code = tracking.get("number")
+    promised_delivery = parse_dt(
+        shipping.get("promisedShippingTime")
+        or tracking.get("estimateDate")
+    )
+    shipped_at = parse_dt(tracking.get("shippedDate"))
+    delivered_at = parse_dt(tracking.get("deliveredDate"))
+
+    address_comp = (
+        shipping.get("comment")
+        or shipping.get("reference")
+    )
     #addr = s.get("address") or {}
     return {
         "order_id": order_id,
-        "carrier": s.get("carrier"),
-        "service": s.get("service"),
-        "tracking_code": s.get("trackingCode"),
-        "promised_delivery": dt(s.get("promisedDeliveryDate")) if s.get("promisedDeliveryDate") else None,
-        "shipped_at": dt(s.get("shippedAt")) if s.get("shippedAt") else None,   
-        "delivered_at": dt(s.get("deliveredAt")) if s.get("deliveredAt") else None,
+
+        "carrier": carrier,
+        "service": service,
+        "tracking_code": tracking_code,
+        "promised_delivery": promised_delivery,
+        "shipped_at": shipped_at,   
+        "delivered_at": delivered_at,
+
         "receiver_name": s.get("receiverName"),
         "address_street": s.get("street"),
         "address_number": s.get("number"),
-        "address_comp": None,
+        "address_comp": address_comp,
         "address_district": s.get("neighborhood"),
         "address_city": s.get("city"),
         "address_state": s.get("state"),
@@ -179,8 +223,8 @@ def map_invoice(order_id: str, inv: dict | None) -> dict | None:
     if not inv: return None
     return {
         "order_id": order_id,
-        "is_invoiced": 1 if (inv.get("status") == "INVOICED" or inv.get("nfeKey")) else 0,
-        "invoice_key": inv.get("nfeKey"),
+        "is_invoiced": 1 if (inv.get("status") == "INVOICED" or inv.get("accessKey")) else 0,
+        "invoice_key": inv.get("accessKey"),
         "number": inv.get("number"),
         "series": inv.get("serie") or inv.get("series"),
         "issued_at": dt(inv.get("issueDate")) if inv.get("issueDate") else None,
