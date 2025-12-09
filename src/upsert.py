@@ -14,7 +14,7 @@ async def upsert_order_tree(session: AsyncSession, payload: dict, marketplace_id
     order_id =payload["id"]
 
     old = await session.execute(
-        text("SELECT status, delivery_status FROM anymarket_orders WHERE id = :id"),
+        text("SELECT status, substatus FROM anymarket_orders WHERE id = :id"),
         {"id": payload["id"]},
     )
     row = old.fetchone()
