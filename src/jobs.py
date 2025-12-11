@@ -1,4 +1,7 @@
 import time
+import asyncio
+from typing import Optional
+import httpx
 
 from sqlalchemy import text
 from src.clients.anymarket import AnyMarketClient, FeedItem
@@ -68,48 +71,113 @@ def _to_iso(dt: datetime) -> str:
         dt = dt.replace(tzinfo=timezone(timedelta(hours=-3)))
     return dt.isoformat()
 
-async def backfill_orders_interval(start: datetime, end: datetime) -> dict:
+PAGE_SIZE = 5
+
+async def backfill_orders_interval(start: str, end: str):
     client = AnyMarketClient()
+
+    start_iso = _to_iso(start)
+    end_iso = _to_iso(end)
+
+    offset = 0
     total = 0
-    page = 0
-    size = 100  # ajuste se quiser
+    page_idx = 0
 
-    created_after = _to_iso(start)
-    created_before = _to_iso(end)
+    try:
+        while True:
+            page_idx += 1
 
-    while True:
-        orders, last = await client.list_orders(
-            created_after=created_after,
-            created_before=created_before,
-            page=page,
-            size=size,
+            url = (
+                f"/orders"
+                f"?createdAfter={start_iso}"
+                f"&createdBefore={end_iso}"
+                f"&offset={offset}"
+            )
+
+            # pequena pausa pra não estourar QPS
+            await asyncio.sleep(0.2)
+
+            log.info(
+                "anymarket-backfill: window %s -> %s, page %s, offset=%s",
+                start_iso, end_iso, page_idx, offset,
+            )
+
+            r = await client._client.get(url)
+            r.raise_for_status()
+            data = r.json()
+
+            content = data.get("content") or []
+            qtd = len(content)
+            log.info(
+                "anymarket-backfill: page %s: %s pedidos (offset=%s)",
+                page_idx, qtd, offset,
+            )
+
+            # critério 1: se não veio nada, acabou
+            if qtd == 0:
+                log.info(
+                    "anymarket-backfill: page %s vazia, encerrando janela %s -> %s",
+                    page_idx, start_iso, end_iso,
+                )
+                break
+
+            # processa pedidos
+            async with Session() as session:
+                async with session.begin():
+                    for p in content:
+                        try:
+                            full = p  # /orders já traz o pedido completo
+
+                            # se quiser tentar returns, mantenha:
+                            """"
+                            try:
+                                rets = await client.list_returns(p["id"])
+                                if rets:
+                                    full["returns"] = rets
+                            except Exception:
+                                pass
+                            """
+
+                            await upsert_order_tree(
+                                session,
+                                full,
+                                map_marketplace_id(full),
+                            )
+                            total += 1
+                        except Exception as e:
+                            log.error(
+                                "anymarket-backfill: erro ao processar pedido %s: %s",
+                                p.get("id"),
+                                e,
+                            )
+
+            # atualiza offset
+            offset += qtd
+
+            # critério 2: se veio menos que PAGE_SIZE, era a última página
+            if qtd < PAGE_SIZE:
+                log.info(
+                    "anymarket-backfill: última página detectada (qtd=%s < %s), "
+                    "encerrando janela %s -> %s",
+                    qtd, PAGE_SIZE, start_iso, end_iso,
+                )
+                break
+
+        log.info(
+            "anymarket-backfill: janela %s -> %s concluída, %s pedidos processados",
+            start_iso, end_iso, total,
         )
-        if not orders:
-            break
+        return {"processed": total}
 
-        log.info("backfill page %s: %s pedidos", page, len(orders))
+    except Exception as e:
+        log.error(
+            "anymarket-backfill: window error (%s -> %s): %s",
+            start_iso, end_iso, e,
+        )
+        raise
+    finally:
+        await client.aclose()
 
-        async with Session() as session:  # type: AsyncSession
-            async with session.begin():
-                for full in orders:
-                    try:
-                        # aqui full é garantidamente dict por causa de list_orders
-                        await upsert_order_tree(session, full, map_marketplace_id(full))
-                        total += 1
-                    except Exception as e:
-                        log.error("backfill order error: %s", e)
-
-        if last:
-            break
-        page += 1
-
-    await client.aclose()
-    return {
-        "processed": total,
-        "pages": page + 1,
-        "start": created_after,
-        "end": created_before,
-    }
 
 async def backfill_full_range(start: datetime, end: datetime) -> dict:
     """
@@ -149,10 +217,6 @@ async def backfill_full_range(start: datetime, end: datetime) -> dict:
         "processed": total_processed,
         "windows": windows,
     }
-
-import asyncio
-import httpx
-from src.log import log
 
 async def fetch_order_with_retry(client, order_id: str, max_retries: int = 5):
     """
@@ -214,6 +278,12 @@ async def fetch_order_with_retry(client, order_id: str, max_retries: int = 5):
     )
     return None
 
+def extract_next_link(resp_json: dict) -> str | None:
+    links = resp_json.get("links") or []
+    for l in links:
+        if l.get("rel") == "next":
+            return l.get("href")
+    return None
 
 async def hydrate_range(start: str):
     # 1) pega IDs na base
@@ -266,3 +336,11 @@ async def hydrate_range(start: str):
 
     await client.aclose()
     log.info("hydrate_range: concluído (%s pedidos)", total)
+
+def extract_next_link(data: dict) -> Optional[str]:
+    links = data.get("links") or []
+    
+    for l in links:
+        if l.get("rel") == "next":
+            return l.get("href")
+    return None
