@@ -39,8 +39,13 @@ class AnyMarketClient:
             "Content-Type": "application/json",
         }
 
-    async def list_feed(self, limit: int) -> list[FeedItem]:
-        r = await self._client.get("/orders/feeds", params={"limit": str(limit)})
+    async def list_feed(self, limit: int | None = None) -> list[FeedItem]:
+        # monta params só se limit não for None
+        params: dict[str, str] | None = None
+        if limit is not None:
+            params = {"limit": str(limit)}
+
+        r = await self._client.get("/orders/feeds", params=params)
         r.raise_for_status()
         data = r.json()
 
@@ -79,7 +84,6 @@ class AnyMarketClient:
                     )
                 )
             else:
-                # item simples (string/number) – sem info pra ACK, usa defaults
                 items.append(
                     FeedItem(
                         id=str(it),
@@ -91,6 +95,7 @@ class AnyMarketClient:
                 )
 
         return items
+
 
     async def get_order(self, order_id: str) -> dict:
         r = await self._client.get(f"/orders/{order_id}")
@@ -131,7 +136,7 @@ class AnyMarketClient:
                 log.warning("ACK feed: item %s sem token, ignorando no ACK", it.id)
                 continue
 
-            # id pode ser numérico; se falhar cast, manda string mesmo
+            # id numérico, como na documentação
             try:
                 ack_id = int(it.id)
             except ValueError:
@@ -140,16 +145,15 @@ class AnyMarketClient:
             payload.append(
                 {
                     "id": ack_id,
-                    "status": it.status or "PENDING",
+                    # status e type fixos conforme doc
                     "token": it.token,
-                    "type": it.type or "ORDER",
+                    "type": "ORDER",
                 }
             )
 
         if not payload:
             return
 
-        # em lotes menores, pra evitar limite de payload
         MAX_BATCH = 50
 
         for i in range(0, len(payload), MAX_BATCH):
@@ -160,10 +164,11 @@ class AnyMarketClient:
                     r = await self._client.put("/orders/feeds/batch", json=batch)
                     r.raise_for_status()
                     log.info(
-                        "ACK feed: lote %s..%s ok (%s eventos)",
+                        "ACK feed: lote %s..%s ok (%s eventos) - status=%s",
                         i,
                         i + len(batch) - 1,
                         len(batch),
+                        r.status_code,
                     )
                     break
                 except httpx.HTTPStatusError as e:
@@ -190,7 +195,6 @@ class AnyMarketClient:
                         await asyncio.sleep(2**attempt)
                         continue
                     break
-
 
     async def aclose(self):
         await self._client.aclose()

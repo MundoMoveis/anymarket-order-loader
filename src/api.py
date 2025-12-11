@@ -1,7 +1,7 @@
 import asyncio
 from fastapi import APIRouter, HTTPException, Query, Body
 from datetime import datetime
-from src.jobs import backfill_full_range, process_feed_cycle, hydrate_order, hydrate_range
+from src.jobs import backfill_full_range, drain_feed, process_feed_cycle, hydrate_order, hydrate_range
 from src.log import log
 
 router = APIRouter()
@@ -12,10 +12,9 @@ async def health():
 
 @router.post("/sync/feed")
 async def sync_feed():
-    try:
-        return await process_feed_cycle()
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    # aqui queremos varrer o feed POR COMPLETO, sem time budget
+    res = await process_feed_cycle(max_ms=None)
+    return res
 
 @router.post("/sync/order/{order_id}")
 async def sync_one(order_id: str):
@@ -45,3 +44,9 @@ async def anymarket_hydrate_range(start: str = Body(..., embed=True)):
     """
     asyncio.create_task(hydrate_range(start))  # se quiser rodar async em background
     return {"ok": True}
+
+# src/api.py
+@router.post("/anymarket/drain-feed")
+async def anymarket_drain_feed():
+    res = await drain_feed()
+    return res

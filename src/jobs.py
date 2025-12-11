@@ -13,42 +13,101 @@ from src.log import log
 from sqlalchemy.ext.asyncio import AsyncSession
 from datetime import datetime, timedelta, timezone
 
-async def process_feed_cycle() -> dict:
+async def process_feed_cycle(max_ms: int | None = None) -> dict:
+    """
+    Processa o feed até ficar vazio ou até atingir max_ms (se informado).
+
+    max_ms=None  -> processa TUDO que tiver no feed.
+    max_ms=valor -> processa até estourar esse tempo em ms.
+    """
     t0 = time.time()
     client = AnyMarketClient()
-    items: list[FeedItem] = await client.list_feed(Cfg.ANY_PAGE)
-    if not items:
-        await client.aclose()
-        return {"processed": 0, "acked": 0, "elapsedMs": 0}
 
-    ack: list[FeedItem] = []
-    async with Session() as session:  # type: AsyncSession
-        async with session.begin():
-            for it in items:
-                try:
-                    full = await client.get_order(it.resourceId)
-                    try:
-                        rets = await client.list_returns(it.resourceId)
-                        if rets:
-                            full["returns"] = rets
-                    except Exception:
-                        pass
-                    await upsert_order_tree(session, full, map_marketplace_id(full))
-                    ack.append(it)
-                except Exception as e:
-                    log.error("feed item error: %s", e)
-                if (time.time() - t0) * 1000 > Cfg.ANY_MAX_MS:
-                    break
-    # commit implícito no context
-    # ACK fora da transação
+    total_processed = 0
+    total_acked = 0
+    cycles = 0
+
     try:
-        await client.ack_feed(ack)
-        a = len(ack)
-    except Exception as e:
-        log.error("ack error: %s", e)
-        a = 0
-    await client.aclose()
-    return {"processed": len(ack), "acked": a, "elapsedMs": int((time.time() - t0) * 1000)}
+        while True:
+            cycles += 1
+            items: list[FeedItem] = await client.list_feed(None)  # sem limite
+            if not items:
+                log.info("process_feed_cycle: feed vazio após %s ciclos", cycles)
+                break
+
+            log.info(
+                "process_feed_cycle: ciclo %s, %s eventos no feed",
+                cycles, len(items),
+            )
+
+            ack: list[FeedItem] = []
+
+            async with Session() as session:  # type: AsyncSession
+                async with session.begin():
+                    for it in items:
+                        # time budget (se configurado)
+                        if max_ms is not None and (time.time() - t0) * 1000 > max_ms:
+                            log.info(
+                                "process_feed_cycle: time budget estourado (%sms), "
+                                "interrompendo processamento",
+                                max_ms,
+                            )
+                            # sai do loop interno; depois ainda faz ACK do que já passou
+                            break
+
+                        try:
+                            # alguns tenants retornam só "id", então usa resourceId ou id
+                            rid = it.resourceId or it.id
+                            full = await client.get_order(rid)
+
+                            try:
+                                rets = await client.list_returns(rid)
+                                if rets:
+                                    full["returns"] = rets
+                            except Exception:
+                                pass
+
+                            await upsert_order_tree(
+                                session,
+                                full,
+                                map_marketplace_id(full),
+                            )
+                            # caminho "ok"
+                            it.status = "PENDING"  # ou "SUCCESS", se preferir
+                            ack.append(it)
+                            total_processed += 1
+
+                        except Exception as e:
+                            log.error("feed item error (id=%s): %s", it.id, e)
+                            # ainda assim, ACKa como erro, pra não ficar travado
+                            it.status = "ERROR"
+                            ack.append(it)
+                            total_processed += 1
+
+                # fim da transação (commit implícito)
+
+            # ACK fora da transação
+            if ack:
+                await client.ack_feed(ack)
+                total_acked += len(ack)
+
+            # se estourou o time budget, para mesmo que ainda tenha eventos sobrando
+            if max_ms is not None and (time.time() - t0) * 1000 > max_ms:
+                log.info(
+                    "process_feed_cycle: parada por time budget após %s ms",
+                    int((time.time() - t0) * 1000),
+                )
+                break
+
+        return {
+            "cycles": cycles,
+            "processed": total_processed,
+            "acked": total_acked,
+            "elapsedMs": int((time.time() - t0) * 1000),
+        }
+
+    finally:
+        await client.aclose()
 
 async def hydrate_order(order_id: str) -> dict:
     client = AnyMarketClient()
@@ -64,7 +123,6 @@ async def hydrate_order(order_id: str) -> dict:
             await upsert_order_tree(session, full, map_marketplace_id(full))
     await client.aclose()
     return {"ok": True}
-
 
 def _to_iso(dt: datetime) -> str:
     if dt.tzinfo is None:
@@ -177,7 +235,6 @@ async def backfill_orders_interval(start: str, end: str):
         raise
     finally:
         await client.aclose()
-
 
 async def backfill_full_range(start: datetime, end: datetime) -> dict:
     """
@@ -344,3 +401,13 @@ def extract_next_link(data: dict) -> Optional[str]:
         if l.get("rel") == "next":
             return l.get("href")
     return None
+
+async def drain_feed(limit: int = 200) -> dict:
+    client = AnyMarketClient()
+    try:
+        items = await client.list_feed(limit)
+        log.info("drain_feed: encontrados %s eventos no feed", len(items))
+        await client.ack_feed(items)
+        return {"seen": len(items)}
+    finally:
+        await client.aclose()
