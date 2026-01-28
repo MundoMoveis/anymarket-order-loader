@@ -4,7 +4,25 @@ import os
 load_dotenv()
 
 class Cfg:
-    ANY_BACKFILL_MAX_DAYS = int(os.getenv("ANY_BACKFILL_MAX_DAYS", "90"))  # menor que 120
+    # Timezone (para cálculo de janelas)
+    TZ = os.getenv("TZ", "America/Sao_Paulo")
+
+    # Backfill
+    # tamanho máximo de cada JANELA interna do backfill_full_range
+    ANY_BACKFILL_WINDOW_DAYS = int(os.getenv("ANY_BACKFILL_WINDOW_DAYS", "1"))
+
+    # rolling windows (range externo)
+    ANY_BACKFILL_RECENT_DAYS = int(os.getenv("ANY_BACKFILL_RECENT_DAYS", "7"))
+    ANY_BACKFILL_ROLLING_DAYS = int(os.getenv("ANY_BACKFILL_ROLLING_DAYS", "90"))
+
+    # crons (vazio = desabilita)
+    ANY_BACKFILL_RECENT_CRON = os.getenv("ANY_BACKFILL_RECENT_CRON", "10 */6 * * *")
+    ANY_BACKFILL_ROLLING_CRON = os.getenv("ANY_BACKFILL_ROLLING_CRON", "30 6,18 * * *")
+
+    # lock
+    ANY_BACKFILL_LOCK_NAME = os.getenv("ANY_BACKFILL_LOCK_NAME", "anymarket:backfill")
+    ANY_BACKFILL_LOCK_TIMEOUT_SEC = int(os.getenv("ANY_BACKFILL_LOCK_TIMEOUT_SEC", "0"))
+
     PORT = int(os.getenv("PORT", "8080"))
     ANY_BASE = os.getenv("ANYMARKET_BASE_URL", "https://api.anymarket.com.br/v2")
     ANY_TOKEN = os.getenv("ANYMARKET_TOKEN") or os.getenv("ANYMARKET_GUNGA_TOKEN", "")

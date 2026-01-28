@@ -1,6 +1,8 @@
 import asyncio
 from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query, Body
+from src.jobs import backfill_recent, backfill_rolling, backfill_full_range_locked
+
 
 from src.jobs import (
     backfill_full_range,
@@ -46,15 +48,11 @@ async def anymarket_backfill(
     start: datetime = Query(..., description="Data/hora inicial"),
     end: datetime = Query(..., description="Data/hora final"),
 ):
-    """
-    Faz backfill do intervalo [start, end] quebrando em janelas.
-    Retorna métricas separadas: fetched vs persisted vs errors.
-    """
     if end <= start:
         raise HTTPException(status_code=400, detail="`end` deve ser maior que `start`.")
 
     try:
-        result = await backfill_full_range(start, end)
+        result = await backfill_full_range_locked(start, end, job="manual")
         return result
     except Exception as e:
         log.exception("anymarket_backfill error")
@@ -84,4 +82,21 @@ async def anymarket_drain_feed():
         return res
     except Exception as e:
         log.exception("drain-feed error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/anymarket/backfill/recent")
+async def anymarket_backfill_recent(days: int = Query(7, description="Quantidade de dias para trás")):
+    try:
+        return await backfill_recent(days)
+    except Exception as e:
+        log.exception("anymarket_backfill_recent error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/anymarket/backfill/rolling")
+async def anymarket_backfill_rolling(days: int = Query(90, description="Quantidade de dias para trás")):
+    try:
+        return await backfill_rolling(days)
+    except Exception as e:
+        log.exception("anymarket_backfill_rolling error")
         raise HTTPException(status_code=500, detail=str(e))

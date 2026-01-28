@@ -2,6 +2,7 @@ import time
 import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import httpx
 from sqlalchemy import text
@@ -20,11 +21,15 @@ PAGE_SIZE = 5
 def _to_iso(dt: datetime) -> str:
     """
     Normaliza datetime para ISO8601 com timezone.
-    Se vier naive, assume America/Sao_Paulo (-03:00).
+    Se vier naive, assume TZ configurada.
     """
+    tz = ZoneInfo(Cfg.TZ) if getattr(Cfg, "TZ", None) else timezone(timedelta(hours=-3))
     if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone(timedelta(hours=-3)))
+        dt = dt.replace(tzinfo=tz)
+    else:
+        dt = dt.astimezone(tz)
     return dt.isoformat()
+
 
 
 async def process_feed_cycle(max_ms: int | None = None) -> dict:
@@ -247,12 +252,53 @@ async def backfill_orders_interval(start: datetime, end: datetime) -> dict:
     finally:
         await client.aclose()
 
+async def _try_acquire_backfill_lock() -> bool:
+    """
+    Lock global para evitar overlap de backfills (recent/rolling/manual).
+    Usa MySQL GET_LOCK (connection-scoped).
+    """
+    lock_name = getattr(Cfg, "ANY_BACKFILL_LOCK_NAME", "anymarket:backfill")
+    timeout = int(getattr(Cfg, "ANY_BACKFILL_LOCK_TIMEOUT_SEC", 0))
+
+    async with Session() as session:
+        res = await session.execute(
+            text("SELECT GET_LOCK(:name, :timeout)"),
+            {"name": lock_name, "timeout": timeout},
+        )
+        v = res.scalar()
+        return bool(v == 1)
+
+
+async def _release_backfill_lock() -> None:
+    lock_name = getattr(Cfg, "ANY_BACKFILL_LOCK_NAME", "anymarket:backfill")
+    async with Session() as session:
+        try:
+            await session.execute(text("SELECT RELEASE_LOCK(:name)"), {"name": lock_name})
+        except Exception:
+            # best effort
+            pass
+
+
+def _calc_range_days(days: int) -> tuple[datetime, datetime]:
+    tz = ZoneInfo(Cfg.TZ) if getattr(Cfg, "TZ", None) else timezone(timedelta(hours=-3))
+    now = datetime.now(tz).replace(microsecond=0)
+
+    # end = agora (ou poderia ser now - 120s)
+    end = now
+
+    # start = meia-noite do dia (end - days)
+    start_day = (end - timedelta(days=days)).date()
+    start = datetime(start_day.year, start_day.month, start_day.day, 0, 0, 0, tzinfo=tz)
+
+    return start, end
+
+
 
 async def backfill_full_range(start: datetime, end: datetime) -> dict:
     """
-    Faz backfill do intervalo [start, end], quebrando em janelas de no máximo ANY_BACKFILL_MAX_DAYS.
+    Faz backfill do intervalo [start, end], quebrando em janelas de no máximo ANY_BACKFILL_WINDOW_DAYS.
     """
-    max_days = max(1, Cfg.ANY_BACKFILL_MAX_DAYS)
+    max_days = max(1, int(getattr(Cfg, "ANY_BACKFILL_WINDOW_DAYS", 1)))
 
     current_start = start
 
@@ -271,7 +317,12 @@ async def backfill_full_range(start: datetime, end: datetime) -> dict:
         if current_end > end:
             current_end = end
 
-        log.info("backfill window: %s -> %s (max %s dias)", current_start.isoformat(), current_end.isoformat(), max_days)
+        log.info(
+            "backfill window: %s -> %s (window=%s dias)",
+            current_start.isoformat(),
+            current_end.isoformat(),
+            max_days,
+        )
 
         try:
             w = await backfill_orders_interval(current_start, current_end)
@@ -281,7 +332,6 @@ async def backfill_full_range(start: datetime, end: datetime) -> dict:
                 totals[k] += int(w.get(k, 0))
 
         except Exception as e:
-            # erro de janela inteira (HTTP etc.)
             log.error("backfill window error (%s -> %s): %s", current_start, current_end, e)
             windows.append(
                 {
@@ -303,9 +353,11 @@ async def backfill_full_range(start: datetime, end: datetime) -> dict:
     return {
         "start": _to_iso(start),
         "end": _to_iso(end),
+        "windowDays": max_days,
         **totals,
         "windows": windows,
     }
+
 
 
 async def fetch_order_with_retry(client: AnyMarketClient, order_id: str, max_retries: int = 5):
@@ -419,3 +471,39 @@ async def drain_feed(limit: int = 200) -> dict:
         return {"seen": len(items)}
     finally:
         await client.aclose()
+        
+async def backfill_full_range_locked(start: datetime, end: datetime, job: str = "manual") -> dict:
+    got = await _try_acquire_backfill_lock()
+    if not got:
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "lock_busy",
+            "job": job,
+            "start": _to_iso(start),
+            "end": _to_iso(end),
+        }
+
+    try:
+        out = await backfill_full_range(start, end)
+        out.update({"job": job, "skipped": False})
+        return out
+    finally:
+        await _release_backfill_lock()
+
+
+async def backfill_recent(days: int | None = None) -> dict:
+    days = int(days or getattr(Cfg, "ANY_BACKFILL_RECENT_DAYS", 7))
+    start, end = _calc_range_days(days)
+    out = await backfill_full_range_locked(start, end, job="recent")
+    out.update({"days": days})
+    return out
+
+
+async def backfill_rolling(days: int | None = None) -> dict:
+    days = int(days or getattr(Cfg, "ANY_BACKFILL_ROLLING_DAYS", 90))
+    start, end = _calc_range_days(days)
+    out = await backfill_full_range_locked(start, end, job="rolling")
+    out.update({"days": days})
+    return out
+

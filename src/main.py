@@ -6,7 +6,7 @@ import uvicorn
 
 from src.api import router
 from src.config import Cfg
-from src.jobs import process_feed_cycle
+from src.jobs import process_feed_cycle, backfill_recent, backfill_rolling
 from src.log import log
 
 app = FastAPI()
@@ -16,22 +16,58 @@ scheduler = AsyncIOScheduler()
 
 @app.on_event("startup")
 async def on_startup():
-    async def run_cycle():
+    async def run_feed():
         try:
             out = await process_feed_cycle()
-            if out.get("processed"):
+            # loga se teve trabalho
+            if out.get("fetched", 0) > 0 or out.get("errors", 0) > 0:
                 log.info(f"feed cycle: {out}")
         except Exception as e:
             log.error(f"feed cycle error: {e}")
 
-    # SÓ cria o cron se ANY_CRON não for vazio
+    async def run_backfill_recent_job():
+        try:
+            out = await backfill_recent()
+            if not out.get("skipped"):
+                log.info(f"backfill recent: {out}")
+            else:
+                log.info(f"backfill recent skipped: {out}")
+        except Exception as e:
+            log.error(f"backfill recent error: {e}")
+
+    async def run_backfill_rolling_job():
+        try:
+            out = await backfill_rolling()
+            if not out.get("skipped"):
+                log.info(f"backfill rolling: {out}")
+            else:
+                log.info(f"backfill rolling skipped: {out}")
+        except Exception as e:
+            log.error(f"backfill rolling error: {e}")
+
+    # Feed
     if Cfg.ANY_CRON.strip():
-        scheduler.add_job(run_cycle, CronTrigger.from_crontab(Cfg.ANY_CRON), id="feed")
-        scheduler.start()
-        log.info(f"cron ready: {Cfg.ANY_CRON}")
+        scheduler.add_job(run_feed, CronTrigger.from_crontab(Cfg.ANY_CRON), id="feed")
+        log.info(f"cron feed ready: {Cfg.ANY_CRON}")
     else:
-        log.info("cron disabled (ANY_CRON vazio)")
+        log.info("cron feed disabled (ANY_CRON vazio)")
 
+    # Backfill recent
+    if Cfg.ANY_BACKFILL_RECENT_CRON.strip():
+        scheduler.add_job(
+            run_backfill_recent_job,
+            CronTrigger.from_crontab(Cfg.ANY_BACKFILL_RECENT_CRON),
+            id="backfill_recent",
+        )
+        log.info(f"cron backfill_recent ready: {Cfg.ANY_BACKFILL_RECENT_CRON}")
 
-if __name__ == "__main__":
-    uvicorn.run("src.main:app", host="0.0.0.0", port=Cfg.PORT, reload=False)
+    # Backfill rolling
+    if Cfg.ANY_BACKFILL_ROLLING_CRON.strip():
+        scheduler.add_job(
+            run_backfill_rolling_job,
+            CronTrigger.from_crontab(Cfg.ANY_BACKFILL_ROLLING_CRON),
+            id="backfill_rolling",
+        )
+        log.info(f"cron backfill_rolling ready: {Cfg.ANY_BACKFILL_ROLLING_CRON}")
+
+    scheduler.start()
