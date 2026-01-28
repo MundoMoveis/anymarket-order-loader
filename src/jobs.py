@@ -184,16 +184,18 @@ async def backfill_orders_interval(start: datetime, end: datetime) -> dict:
                 f"&offset={offset}"
             )
 
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(float(getattr(Cfg, "ANY_BACKFILL_SLEEP_SEC", 0.5)))
 
             log.info(
                 "anymarket-backfill: window %s -> %s, page %s, offset=%s",
                 start_iso, end_iso, page_idx, offset,
             )
 
-            r = await client._client.get(url)
-            r.raise_for_status()
-            data = r.json()
+            data = await _get_with_backoff(
+                client,
+                url,
+                ctx=f"anymarket-backfill GET /orders window {start_iso}->{end_iso} page={page_idx} offset={offset}",
+            )
 
             content = data.get("content") or []
             qtd = len(content)
@@ -427,7 +429,8 @@ async def hydrate_range(start: str):
     client = AnyMarketClient()
     try:
         for idx, oid in enumerate(ids, start=1):
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(float(getattr(Cfg, "ANY_BACKFILL_SLEEP_SEC", 0.5)))
+
 
             try:
                 full = await fetch_order_with_retry(client, oid)
@@ -506,4 +509,69 @@ async def backfill_rolling(days: int | None = None) -> dict:
     out = await backfill_full_range_locked(start, end, job="rolling")
     out.update({"days": days})
     return out
+
+async def _get_with_backoff(client: AnyMarketClient, url: str, ctx: str) -> dict:
+    """
+    GET com retry para 429/5xx.
+    Respeita Retry-After quando existir.
+    Retorna JSON dict.
+    """
+    delay = 1.0
+    max_retries = int(getattr(Cfg, "ANY_BACKFILL_MAX_RETRIES", 6))
+    max_backoff = int(getattr(Cfg, "ANY_BACKFILL_MAX_BACKOFF_SEC", 120))
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = await client._client.get(url)
+            r.raise_for_status()
+            data = r.json()
+            return data if isinstance(data, dict) else {"content": data if isinstance(data, list) else []}
+
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+
+            # Rate limit
+            if status == 429:
+                retry_after = e.response.headers.get("Retry-After")
+                wait = delay
+                if retry_after:
+                    try:
+                        wait = float(retry_after)
+                    except ValueError:
+                        wait = delay
+
+                wait = min(wait, max_backoff)
+
+                log.warning(
+                    "%s: 429 Too Many Requests (tent %s/%s). aguardando %ss",
+                    ctx, attempt, max_retries, wait
+                )
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, float(max_backoff))
+                continue
+
+            # 5xx: retry com backoff
+            if 500 <= status < 600:
+                wait = min(delay, float(max_backoff))
+                log.warning(
+                    "%s: HTTP %s (tent %s/%s). aguardando %ss",
+                    ctx, status, attempt, max_retries, wait
+                )
+                await asyncio.sleep(wait)
+                delay = min(delay * 2, float(max_backoff))
+                continue
+
+            # 4xx não retry (exceto 429)
+            body = e.response.text[:500]
+            log.error("%s: HTTP %s sem retry. body=%s", ctx, status, body)
+            raise
+
+        except httpx.HTTPError as e:
+            # erro de rede: retry
+            wait = min(delay, float(max_backoff))
+            log.warning("%s: erro de rede (tent %s/%s): %s. aguardando %ss", ctx, attempt, max_retries, e, wait)
+            await asyncio.sleep(wait)
+            delay = min(delay * 2, float(max_backoff))
+
+    raise RuntimeError(f"{ctx}: falha após {max_retries} tentativas (rate limit/rede).")
 

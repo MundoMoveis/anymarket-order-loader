@@ -40,3 +40,7 @@ class Cfg:
     DB_NAME = os.getenv("DB_DATABASE", "anymarket")
     DB_POOL = int(os.getenv("DB_POOL_SIZE", "10"))
     DB_OVER = int(os.getenv("DB_POOL_OVERFLOW", "5"))
+
+    ANY_BACKFILL_SLEEP_SEC = float(os.getenv("ANY_BACKFILL_SLEEP_SEC", "0.5"))  # pausa entre páginas
+    ANY_BACKFILL_MAX_RETRIES = int(os.getenv("ANY_BACKFILL_MAX_RETRIES", "6"))
+    ANY_BACKFILL_MAX_BACKOFF_SEC = int(os.getenv("ANY_BACKFILL_MAX_BACKOFF_SEC", "120"))
